@@ -13,3 +13,10 @@ wheels/
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
+
+# Generated benchmark output
+results.csv
+chart.png
+
+# Claude Code project settings
+.claude/
