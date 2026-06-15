@@ -3,9 +3,11 @@ import math
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
+import openai
 import pytest
 
-from runner import benchmark_request, run_benchmark
+from runner import MAX_RETRIES, benchmark_request, run_benchmark
 
 
 def _make_chunk(content: str | None = None, completion_tokens: int | None = None) -> Any:
@@ -87,7 +89,8 @@ async def test_benchmark_request_ttft_le_latency() -> None:
     assert not math.isnan(result["ttft_s"])
 
 
-async def test_benchmark_request_token_rate_equals_tokens_over_latency() -> None:
+async def test_benchmark_request_token_rate_uses_decode_time() -> None:
+    # token_rate = (tokens - 1) / (latency - ttft): excludes the prefill phase
     client = _make_client(
         [
             _make_chunk(content="Hi"),
@@ -96,8 +99,27 @@ async def test_benchmark_request_token_rate_equals_tokens_over_latency() -> None
     )
     result = await benchmark_request(client, "gpt-4o", "prompt", asyncio.Semaphore(1), 0)
     assert result["completion_tokens"] == 10
-    expected_rate = 10 / result["latency_s"]
-    assert abs(result["token_rate_tok_s"] - expected_rate) < 0.01
+    decode_s = result["latency_s"] - result["ttft_s"]
+    expected_rate = (result["completion_tokens"] - 1) / decode_s
+    assert abs(result["token_rate_tok_s"] - expected_rate) < 0.001
+
+
+async def test_benchmark_request_ttft_ignores_empty_content_chunk() -> None:
+    # First chunk from OpenAI carries role="assistant", content="" — not a real token.
+    role_chunk = SimpleNamespace(
+        choices=[SimpleNamespace(delta=SimpleNamespace(content=""))],
+        usage=None,
+    )
+    client = _make_client(
+        [
+            role_chunk,
+            _make_chunk(content="Hello"),
+            _make_chunk(completion_tokens=1),
+        ]
+    )
+    result = await benchmark_request(client, "gpt-4o", "prompt", asyncio.Semaphore(1), 0)
+    # TTFT should still be measured (on the "Hello" chunk), not nan
+    assert not math.isnan(result["ttft_s"])
 
 
 async def test_benchmark_request_no_error_on_success() -> None:
@@ -205,6 +227,85 @@ async def test_run_benchmark_prints_model_progress(
         prompt="test",
     )
 
-    out = capsys.readouterr().out
-    assert "Benchmarking model-a" in out
-    assert "Benchmarking model-b" in out
+    err = capsys.readouterr().err
+    assert "model-a" in err
+    assert "model-b" in err
+
+
+# --- Rate-limit / retry helpers ---
+
+
+def _make_rate_limit_error() -> openai.RateLimitError:
+    request = httpx.Request("POST", "http://localhost/v1/chat/completions")
+    response = httpx.Response(429, request=request)
+    return openai.RateLimitError("rate limit exceeded", response=response, body=None)
+
+
+def _make_flaky_client(n_fails: int, chunks: list[Any]) -> Any:
+    """Raises RateLimitError for the first n_fails calls, then streams chunks."""
+    call_count = 0
+
+    async def create(**kwargs: Any) -> Any:
+        nonlocal call_count
+        call_count += 1
+        if call_count <= n_fails:
+            raise _make_rate_limit_error()
+
+        async def _gen() -> Any:
+            for c in chunks:
+                yield c
+
+        return _gen()
+
+    return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+
+
+def _make_always_rate_limit_client() -> Any:
+    async def create(**kwargs: Any) -> Any:
+        raise _make_rate_limit_error()
+
+    return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+
+
+def _no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_sleep(_: float) -> None:
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+
+# --- Rate-limit tests ---
+
+
+async def test_benchmark_request_zero_retries_on_success() -> None:
+    client = _make_client([_make_chunk(content="Hi"), _make_chunk(completion_tokens=1)])
+    result = await benchmark_request(client, "gpt-4o", "prompt", asyncio.Semaphore(1), 0)
+    assert result["retries"] == 0
+
+
+async def test_benchmark_request_retries_once_on_rate_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    _no_sleep(monkeypatch)
+    chunks = [_make_chunk(content="Hi"), _make_chunk(completion_tokens=1)]
+    client = _make_flaky_client(1, chunks)
+    result = await benchmark_request(client, "gpt-4o", "prompt", asyncio.Semaphore(1), 0)
+    assert result["retries"] == 1
+    assert result["error"] == ""
+    assert not math.isnan(result["latency_s"])
+
+
+async def test_benchmark_request_exhausts_retries_on_persistent_rate_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _no_sleep(monkeypatch)
+    client = _make_always_rate_limit_client()
+    result = await benchmark_request(client, "gpt-4o", "prompt", asyncio.Semaphore(1), 0)
+    assert result["retries"] == MAX_RETRIES
+    assert result["error"] != ""
+    assert math.isnan(result["latency_s"])
+
+
+async def test_benchmark_request_no_retry_on_generic_error() -> None:
+    client = _make_error_client("connection refused")
+    result = await benchmark_request(client, "gpt-4o", "prompt", asyncio.Semaphore(1), 0)
+    assert result["retries"] == 0
+    assert result["error"] == "connection refused"

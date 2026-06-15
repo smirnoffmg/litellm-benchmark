@@ -2,7 +2,11 @@ import asyncio
 import time
 from typing import Any
 
+import openai
 from openai import AsyncOpenAI
+from tqdm.asyncio import tqdm
+
+MAX_RETRIES = 3
 
 
 async def benchmark_request(
@@ -13,51 +17,71 @@ async def benchmark_request(
     request_index: int,
 ) -> dict[str, Any]:
     async with semaphore:
-        start = time.perf_counter()
-        ttft_s = float("nan")
-        completion_tokens = 0
-        error = ""
-        first_chunk = True
+        last_error = ""
 
-        try:
-            stream = await client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                stream=True,
-                stream_options={"include_usage": True},
+        for attempt in range(MAX_RETRIES + 1):
+            start = time.perf_counter()
+            ttft_s = float("nan")
+            completion_tokens = 0
+            first_chunk = True
+
+            try:
+                stream = await client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    stream=True,
+                    stream_options={"include_usage": True},
+                )
+                async for chunk in stream:
+                    if first_chunk and chunk.choices and chunk.choices[0].delta.content:
+                        ttft_s = time.perf_counter() - start
+                        first_chunk = False
+                    if chunk.usage:
+                        completion_tokens = chunk.usage.completion_tokens or 0
+            except openai.RateLimitError as exc:
+                last_error = str(exc)
+                if attempt < MAX_RETRIES:
+                    await asyncio.sleep(2**attempt)
+                continue
+            except Exception as exc:
+                return {
+                    "model": model,
+                    "request_index": request_index,
+                    "latency_s": float("nan"),
+                    "ttft_s": float("nan"),
+                    "completion_tokens": 0,
+                    "token_rate_tok_s": float("nan"),
+                    "error": str(exc),
+                    "retries": attempt,
+                }
+
+            latency_s = time.perf_counter() - start
+            decode_s = latency_s - ttft_s
+            token_rate = (
+                (completion_tokens - 1) / decode_s
+                if completion_tokens > 1 and decode_s > 0
+                else float("nan")
             )
-            async for chunk in stream:
-                if first_chunk and chunk.choices:
-                    ttft_s = time.perf_counter() - start
-                    first_chunk = False
-                if chunk.usage:
-                    completion_tokens = chunk.usage.completion_tokens or 0
-        except Exception as exc:
-            error = str(exc)
-
-        latency_s = time.perf_counter() - start
-
-        if error:
             return {
                 "model": model,
                 "request_index": request_index,
-                "latency_s": float("nan"),
-                "ttft_s": float("nan"),
-                "completion_tokens": 0,
-                "token_rate_tok_s": float("nan"),
-                "error": error,
+                "latency_s": latency_s,
+                "ttft_s": ttft_s,
+                "completion_tokens": completion_tokens,
+                "token_rate_tok_s": token_rate,
+                "error": "",
+                "retries": attempt,
             }
-
-        token_rate = completion_tokens / latency_s if completion_tokens else float("nan")
 
         return {
             "model": model,
             "request_index": request_index,
-            "latency_s": latency_s,
-            "ttft_s": ttft_s,
-            "completion_tokens": completion_tokens,
-            "token_rate_tok_s": token_rate,
-            "error": error,
+            "latency_s": float("nan"),
+            "ttft_s": float("nan"),
+            "completion_tokens": 0,
+            "token_rate_tok_s": float("nan"),
+            "error": last_error,
+            "retries": MAX_RETRIES,
         }
 
 
@@ -73,8 +97,7 @@ async def run_benchmark(
     semaphore = asyncio.Semaphore(concurrency)
     results: list[dict[str, Any]] = []
     for model in models:
-        print(f"Benchmarking {model} ({n_requests} requests, concurrency={concurrency})...")
         tasks = [benchmark_request(client, model, prompt, semaphore, i) for i in range(n_requests)]
-        model_results = await asyncio.gather(*tasks)
+        model_results = await tqdm.gather(*tasks, desc=model, unit="req")
         results.extend(model_results)
     return results
