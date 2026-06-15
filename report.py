@@ -18,19 +18,19 @@ def write_csv(results: list[dict[str, Any]], path: str) -> None:
 # For token_rate higher is better, so tiers are inverted.
 _GATES: dict[str, list[tuple[float, float, str, str]]] = {
     "latency_s": [
-        (0,   5,   "#2ecc71", "Smooth"),   # ≤ 5s
-        (5,   15,  "#f39c12", "Usable"),   # 5–15s
-        (15,  999, "#e74c3c", "Slow"),     # > 15s
+        (0, 5, "#2ecc71", "Smooth"),  # ≤ 5s
+        (5, 15, "#f39c12", "Usable"),  # 5–15s
+        (15, 999, "#e74c3c", "Slow"),  # > 15s
     ],
     "ttft_s": [
-        (0,   2,   "#2ecc71", "Smooth"),
-        (2,   8,   "#f39c12", "Usable"),
-        (8,   999, "#e74c3c", "Slow"),
+        (0, 2, "#2ecc71", "Smooth"),
+        (2, 8, "#f39c12", "Usable"),
+        (8, 999, "#e74c3c", "Slow"),
     ],
     "token_rate_tok_s": [
-        (15,  999, "#2ecc71", "Smooth"),   # ≥ 15 tok/s
-        (7,   15,  "#f39c12", "Usable"),   # 7–15 tok/s
-        (0,   7,   "#e74c3c", "Slow"),     # < 7 tok/s
+        (15, 999, "#2ecc71", "Smooth"),  # ≥ 15 tok/s
+        (7, 15, "#f39c12", "Usable"),  # 7–15 tok/s
+        (0, 7, "#e74c3c", "Slow"),  # < 7 tok/s
     ],
 }
 
@@ -49,9 +49,14 @@ def _draw_gates(ax: matplotlib.axes.Axes, col: str, ymax: float, log_scale: bool
         ax.axhline(band_lo, color=color, linewidth=0.8, linestyle=":", alpha=0.6, zorder=1)
         if lo > 0:
             ax.text(
-                0.01, band_lo, tier_label,
+                0.01,
+                band_lo,
+                tier_label,
                 transform=ax.get_yaxis_transform(),
-                fontsize=8, color=color, va="bottom", alpha=0.85,
+                fontsize=8,
+                color=color,
+                va="bottom",
+                alpha=0.85,
             )
 
 
@@ -87,8 +92,12 @@ def write_chart(results: list[dict[str, Any]], path: str) -> None:
         for model, grp in df.groupby("model"):
             rolled = grp.set_index("request_index")[col].rolling(3, min_periods=1).mean()
             ax.plot(
-                rolled.index, rolled.values,
-                linestyle="--", linewidth=1.5, alpha=0.6, color=model_colors[model],
+                rolled.index,
+                rolled.values,
+                linestyle="--",
+                linewidth=1.5,
+                alpha=0.6,
+                color=model_colors[model],
             )
 
         log_scale = col in _LOG_SCALE_METRICS

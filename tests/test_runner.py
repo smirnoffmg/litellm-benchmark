@@ -283,7 +283,9 @@ async def test_benchmark_request_zero_retries_on_success() -> None:
     assert result["retries"] == 0
 
 
-async def test_benchmark_request_retries_once_on_rate_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_benchmark_request_retries_once_on_rate_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _no_sleep(monkeypatch)
     chunks = [_make_chunk(content="Hi"), _make_chunk(completion_tokens=1)]
     client = _make_flaky_client(1, chunks)
