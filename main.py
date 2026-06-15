@@ -1,10 +1,16 @@
 import argparse
 import asyncio
 import os
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
-from report import write_chart, write_csv
+from report import write_chart, write_csv, write_percentile_chart, write_summary_csv
 from runner import run_benchmark
+
+
+def _default_stem() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -23,8 +29,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--delay", type=float, default=1.0, metavar="SECONDS", help="Delay between request launches"
     )
-    parser.add_argument("--output", default="results.csv", help="CSV output path")
-    parser.add_argument("--chart", default="chart.png", help="Chart output path")
+    parser.add_argument(
+        "--warmup", type=int, default=3, metavar="N", help="Warmup requests per model (discarded)"
+    )
+    parser.add_argument("--output", default=None, help="CSV output path")
+    parser.add_argument("--chart", default=None, help="Chart output path")
     return parser.parse_args(argv)
 
 
@@ -41,6 +50,11 @@ def get_config_from_env() -> dict[str, str]:
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     config = get_config_from_env()
+    stem = _default_stem()
+    output = args.output or f"results_{stem}.csv"
+    chart = args.chart or f"chart_{stem}.png"
+    summary = str(Path(output).with_name(Path(output).stem + "_summary.csv"))
+    percentile_chart = str(Path(chart).with_name(f"percentile_{stem}.png"))
     results: list[dict[str, Any]] = asyncio.run(
         run_benchmark(
             base_url=config["base_url"],
@@ -50,11 +64,20 @@ def main(argv: list[str] | None = None) -> None:
             n_requests=args.requests,
             prompt=args.prompt,
             delay_s=args.delay,
+            warmup=args.warmup,
         )
     )
-    write_csv(results, args.output)
-    write_chart(results, args.chart)
-    print(f"Done. Results: {args.output}  Chart: {args.chart}")
+    write_csv(results, output)
+    write_summary_csv(results, summary)
+    write_chart(results, chart)
+    write_percentile_chart(results, percentile_chart)
+    print(
+        f"Done. \n"
+        f"Results: {output}\n"
+        f"Summary: {summary}\n"
+        f"Chart: {chart}\n"
+        f"Percentiles: {percentile_chart}"
+    )
 
 
 if __name__ == "__main__":

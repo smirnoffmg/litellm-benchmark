@@ -102,11 +102,18 @@ async def run_benchmark(
     n_requests: int,
     prompt: str,
     delay_s: float = 1.0,
+    warmup: int = 3,
 ) -> list[dict[str, Any]]:
     client = AsyncOpenAI(base_url=base_url, api_key=api_key)
     semaphore = asyncio.Semaphore(concurrency)
     results: list[dict[str, Any]] = []
     for model in models:
+        if warmup > 0:
+            warmup_tasks = [
+                asyncio.create_task(benchmark_request(client, model, prompt, semaphore, -(i + 1)))
+                for i in range(warmup)
+            ]
+            await tqdm.gather(*warmup_tasks, desc=f"{model} [warmup]", unit="req")
         tasks: list[asyncio.Task[dict[str, Any]]] = []
         for i in range(n_requests):
             if i > 0 and delay_s > 0:

@@ -336,6 +336,43 @@ async def test_run_benchmark_staggers_requests_by_delay(monkeypatch: pytest.Monk
     assert sleep_calls == [1.5, 1.5]  # n_requests-1 sleeps, no sleep before request 0
 
 
+async def test_run_benchmark_warmup_excluded_from_results(monkeypatch: pytest.MonkeyPatch) -> None:
+    chunks = [_make_chunk(content="Hi"), _make_chunk(completion_tokens=1)]
+    monkeypatch.setattr("runner.AsyncOpenAI", lambda **kwargs: _make_patched_client(chunks))
+
+    results = await run_benchmark(
+        base_url="http://localhost:4000",
+        api_key="sk-test",
+        models=["model-a"],
+        concurrency=1,
+        n_requests=3,
+        prompt="test",
+        warmup=2,
+    )
+
+    assert len(results) == 3
+
+
+async def test_run_benchmark_warmup_request_indices_start_at_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chunks = [_make_chunk(content="Hi"), _make_chunk(completion_tokens=1)]
+    monkeypatch.setattr("runner.AsyncOpenAI", lambda **kwargs: _make_patched_client(chunks))
+
+    results = await run_benchmark(
+        base_url="http://localhost:4000",
+        api_key="sk-test",
+        models=["model-a"],
+        concurrency=1,
+        n_requests=2,
+        prompt="test",
+        warmup=2,
+    )
+
+    indices = sorted(r["request_index"] for r in results)
+    assert indices == [0, 1]
+
+
 async def test_run_benchmark_no_sleep_on_zero_delay(monkeypatch: pytest.MonkeyPatch) -> None:
     chunks = [_make_chunk(content="Hi"), _make_chunk(completion_tokens=1)]
     monkeypatch.setattr("runner.AsyncOpenAI", lambda **kwargs: _make_patched_client(chunks))

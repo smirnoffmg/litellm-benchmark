@@ -20,3 +20,5 @@ chart.png
 
 # Claude Code project settings
 .claude/
+
+.DS_Store
