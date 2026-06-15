@@ -311,3 +311,71 @@ async def test_benchmark_request_no_retry_on_generic_error() -> None:
     result = await benchmark_request(client, "gpt-4o", "prompt", asyncio.Semaphore(1), 0)
     assert result["retries"] == 0
     assert result["error"] == "connection refused"
+
+
+async def test_run_benchmark_staggers_requests_by_delay(monkeypatch: pytest.MonkeyPatch) -> None:
+    chunks = [_make_chunk(content="Hi"), _make_chunk(completion_tokens=1)]
+    monkeypatch.setattr("runner.AsyncOpenAI", lambda **kwargs: _make_patched_client(chunks))
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(s: float) -> None:
+        sleep_calls.append(s)
+
+    monkeypatch.setattr("runner.asyncio.sleep", fake_sleep)
+
+    await run_benchmark(
+        base_url="http://localhost",
+        api_key="k",
+        models=["m"],
+        concurrency=5,
+        n_requests=3,
+        prompt="p",
+        delay_s=1.5,
+    )
+
+    assert sleep_calls == [1.5, 1.5]  # n_requests-1 sleeps, no sleep before request 0
+
+
+async def test_run_benchmark_no_sleep_on_zero_delay(monkeypatch: pytest.MonkeyPatch) -> None:
+    chunks = [_make_chunk(content="Hi"), _make_chunk(completion_tokens=1)]
+    monkeypatch.setattr("runner.AsyncOpenAI", lambda **kwargs: _make_patched_client(chunks))
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(s: float) -> None:
+        sleep_calls.append(s)
+
+    monkeypatch.setattr("runner.asyncio.sleep", fake_sleep)
+
+    await run_benchmark(
+        base_url="http://localhost",
+        api_key="k",
+        models=["m"],
+        concurrency=5,
+        n_requests=3,
+        prompt="p",
+        delay_s=0.0,
+    )
+
+    assert sleep_calls == []
+
+
+async def test_benchmark_request_sends_unique_prompt_and_no_store() -> None:
+    captured: list[dict[str, Any]] = []
+
+    async def create(**kwargs: Any) -> Any:
+        captured.append(kwargs)
+
+        async def _gen() -> Any:
+            yield _make_chunk(content="Hi")
+            yield _make_chunk(completion_tokens=1)
+
+        return _gen()
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    await benchmark_request(client, "gpt-4o", "hello", asyncio.Semaphore(1), 3)
+
+    assert len(captured) == 1
+    msg_content = captured[0]["messages"][0]["content"]
+    assert "hello" in msg_content
+    assert "3" in msg_content, "request index must be embedded to bust the LiteLLM cache"
+    assert captured[0].get("extra_body", {}).get("no-store") is True

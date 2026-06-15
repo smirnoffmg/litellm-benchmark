@@ -20,6 +20,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--concurrency", type=int, default=5, help="Max concurrent requests")
     parser.add_argument("--requests", type=int, default=20, help="Total requests per model")
     parser.add_argument("--prompt", default="Write a short poem about benchmarks")
+    parser.add_argument(
+        "--delay", type=float, default=1.0, metavar="SECONDS", help="Delay between request launches"
+    )
     parser.add_argument("--output", default="results.csv", help="CSV output path")
     parser.add_argument("--chart", default="chart.png", help="Chart output path")
     return parser.parse_args(argv)
@@ -46,6 +49,7 @@ def main(argv: list[str] | None = None) -> None:
             concurrency=args.concurrency,
             n_requests=args.requests,
             prompt=args.prompt,
+            delay_s=args.delay,
         )
     )
     write_csv(results, args.output)

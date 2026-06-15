@@ -1,6 +1,6 @@
 import asyncio
 import time
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 import openai
 from openai import AsyncOpenAI
@@ -9,8 +9,14 @@ from tqdm.asyncio import tqdm
 MAX_RETRIES = 3
 
 
+@runtime_checkable
+class _ChatClient(Protocol):
+    @property
+    def chat(self) -> Any: ...
+
+
 async def benchmark_request(
-    client: AsyncOpenAI,
+    client: _ChatClient,
     model: str,
     prompt: str,
     semaphore: asyncio.Semaphore,
@@ -18,6 +24,8 @@ async def benchmark_request(
 ) -> dict[str, Any]:
     async with semaphore:
         last_error = ""
+        # Append index so identical prompts never hit LiteLLM's semantic cache.
+        unique_prompt = f"{prompt} [req={request_index}]"
 
         for attempt in range(MAX_RETRIES + 1):
             start = time.perf_counter()
@@ -28,9 +36,10 @@ async def benchmark_request(
             try:
                 stream = await client.chat.completions.create(
                     model=model,
-                    messages=[{"role": "user", "content": prompt}],
+                    messages=[{"role": "user", "content": unique_prompt}],
                     stream=True,
                     stream_options={"include_usage": True},
+                    extra_body={"no-store": True},  # bypass LiteLLM cache
                 )
                 async for chunk in stream:
                     if first_chunk and chunk.choices and chunk.choices[0].delta.content:
@@ -92,12 +101,19 @@ async def run_benchmark(
     concurrency: int,
     n_requests: int,
     prompt: str,
+    delay_s: float = 1.0,
 ) -> list[dict[str, Any]]:
     client = AsyncOpenAI(base_url=base_url, api_key=api_key)
     semaphore = asyncio.Semaphore(concurrency)
     results: list[dict[str, Any]] = []
     for model in models:
-        tasks = [benchmark_request(client, model, prompt, semaphore, i) for i in range(n_requests)]
+        tasks: list[asyncio.Task[dict[str, Any]]] = []
+        for i in range(n_requests):
+            if i > 0 and delay_s > 0:
+                await asyncio.sleep(delay_s)
+            tasks.append(
+                asyncio.create_task(benchmark_request(client, model, prompt, semaphore, i))
+            )
         model_results = await tqdm.gather(*tasks, desc=model, unit="req")
         results.extend(model_results)
     return results
