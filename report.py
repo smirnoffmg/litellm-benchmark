@@ -10,6 +10,8 @@ import matplotlib.ticker  # noqa: E402
 import pandas as pd
 import seaborn as sns
 
+_PERCENTILE_DEFS: list[tuple[str, float]] = [("p50", 0.50), ("p95", 0.95), ("p99", 0.99)]
+
 
 def write_csv(results: list[dict[str, Any]], path: str) -> None:
     pd.DataFrame(results).to_csv(path, index=False)
@@ -23,13 +25,8 @@ def write_summary_csv(results: list[dict[str, Any]], path: str) -> None:
         for metric in metrics:
             col = grp[metric].dropna()
             rows.append(
-                {
-                    "model": model,
-                    "metric": metric,
-                    "p50": col.quantile(0.50),
-                    "p95": col.quantile(0.95),
-                    "p99": col.quantile(0.99),
-                }
+                {"model": model, "metric": metric}
+                | {label: col.quantile(q) for label, q in _PERCENTILE_DEFS}
             )
     pd.DataFrame(rows).to_csv(path, index=False)
 
@@ -89,8 +86,8 @@ def write_percentile_chart(results: list[dict[str, Any]], path: str) -> None:
         ("ttft_s", "TTFT (s)"),
         ("token_rate_tok_s", "Token Rate (tok/s)"),
     ]
-    quantiles = [0.50, 0.80, 0.95]
-    pct_labels = ["p50", "p80", "p95"]
+    pct_labels = [label for label, _ in _PERCENTILE_DEFS]
+    quantiles = [q for _, q in _PERCENTILE_DEFS]
 
     models = df["model"].unique()
     n_models = len(models)

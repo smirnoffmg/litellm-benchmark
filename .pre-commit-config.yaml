@@ -14,3 +14,9 @@ repos:
         types: [python]
         pass_filenames: false
         args: [.]
+      - id: pytest
+        name: pytest
+        entry: uv run --frozen pytest
+        language: system
+        pass_filenames: false
+        always_run: true

@@ -2,9 +2,17 @@ import os
 from pathlib import Path
 from typing import Any
 
+import matplotlib.axes
 import pandas as pd
+import pytest
 
-from report import write_chart, write_csv, write_percentile_chart, write_summary_csv
+from report import (
+    _PERCENTILE_DEFS,
+    write_chart,
+    write_csv,
+    write_percentile_chart,
+    write_summary_csv,
+)
 
 SAMPLE: list[dict[str, Any]] = [
     {
@@ -35,12 +43,6 @@ SAMPLE: list[dict[str, Any]] = [
         "error": "",
     },
 ]
-
-
-def test_write_csv_creates_file(tmp_path: Path) -> None:
-    path = str(tmp_path / "results.csv")
-    write_csv(SAMPLE, path)
-    assert os.path.exists(path)
 
 
 def test_write_csv_correct_row_count(tmp_path: Path) -> None:
@@ -74,12 +76,6 @@ def test_write_csv_preserves_values(tmp_path: Path) -> None:
     assert abs(df.iloc[0]["latency_s"] - 1.2) < 0.001
 
 
-def test_write_chart_creates_file(tmp_path: Path) -> None:
-    path = str(tmp_path / "chart.png")
-    write_chart(SAMPLE, path)
-    assert os.path.exists(path)
-
-
 def test_write_chart_file_is_nonempty(tmp_path: Path) -> None:
     path = str(tmp_path / "chart.png")
     write_chart(SAMPLE, path)
@@ -100,12 +96,6 @@ _SUMMARY_SAMPLE: list[dict[str, Any]] = [
 ]
 
 
-def test_write_summary_csv_creates_file(tmp_path: Path) -> None:
-    path = str(tmp_path / "summary.csv")
-    write_summary_csv(_SUMMARY_SAMPLE, path)
-    assert os.path.exists(path)
-
-
 def test_write_summary_csv_columns(tmp_path: Path) -> None:
     path = str(tmp_path / "summary.csv")
     write_summary_csv(_SUMMARY_SAMPLE, path)
@@ -121,12 +111,6 @@ def test_write_summary_csv_p50_latency(tmp_path: Path) -> None:
     assert abs(row["p50"] - 2.0) < 0.01  # median of [1.0, 2.0, 3.0]
 
 
-def test_write_percentile_chart_creates_file(tmp_path: Path) -> None:
-    path = str(tmp_path / "percentile.png")
-    write_percentile_chart(SAMPLE, path)
-    assert os.path.exists(path)
-
-
 def test_write_percentile_chart_file_is_nonempty(tmp_path: Path) -> None:
     path = str(tmp_path / "percentile.png")
     write_percentile_chart(SAMPLE, path)
@@ -138,3 +122,35 @@ def test_write_summary_csv_row_count(tmp_path: Path) -> None:
     write_summary_csv(_SUMMARY_SAMPLE, path)
     df = pd.read_csv(path)
     assert len(df) == 3  # 1 model × 3 metrics
+
+
+# --- Percentile consistency tests ---
+
+
+def test_percentile_defs_labels() -> None:
+    labels = [label for label, _ in _PERCENTILE_DEFS]
+    assert labels == ["p50", "p95", "p99"]
+
+
+def test_percentile_defs_excludes_p80() -> None:
+    labels = [label for label, _ in _PERCENTILE_DEFS]
+    assert "p80" not in labels
+
+
+def test_write_percentile_chart_xticklabels_match_defs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    labels_seen: list[str] = []
+    orig = matplotlib.axes.Axes.set_xticklabels
+
+    def capture(self: matplotlib.axes.Axes, labels: list[str], *args: Any, **kwargs: Any) -> Any:
+        labels_seen.extend(list(labels))
+        return orig(self, labels, *args, **kwargs)
+
+    monkeypatch.setattr(matplotlib.axes.Axes, "set_xticklabels", capture)
+    write_percentile_chart(SAMPLE, str(tmp_path / "p.png"))
+
+    expected = [label for label, _ in _PERCENTILE_DEFS]
+    assert "p80" not in labels_seen
+    for label in expected:
+        assert label in labels_seen

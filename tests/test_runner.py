@@ -38,30 +38,22 @@ def _make_error_client(message: str) -> Any:
     return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
 
 
-def _make_patched_client(chunks: list[Any]) -> Any:
-    return _make_client(chunks)
+def _make_ok_client() -> Any:
+    """Client that immediately yields one content chunk and a usage chunk."""
+    return _make_client([_make_chunk(content="Hi"), _make_chunk(completion_tokens=1)])
 
 
-async def test_benchmark_request_returns_correct_model() -> None:
-    client = _make_client(
-        [
-            _make_chunk(content="Hello"),
-            _make_chunk(completion_tokens=1),
-        ]
-    )
-    result = await benchmark_request(client, "gpt-4o", "prompt", asyncio.Semaphore(1), 0)
-    assert result["model"] == "gpt-4o"
+def _make_slow_client() -> Any:
+    """Client whose stream stalls indefinitely — used to trigger asyncio.timeout."""
 
+    async def create(**kwargs: Any) -> Any:
+        async def _gen() -> Any:
+            await asyncio.sleep(10)
+            yield _make_chunk(content="Hi")  # pragma: no cover
 
-async def test_benchmark_request_returns_correct_index() -> None:
-    client = _make_client(
-        [
-            _make_chunk(content="Hi"),
-            _make_chunk(completion_tokens=1),
-        ]
-    )
-    result = await benchmark_request(client, "gpt-4o", "prompt", asyncio.Semaphore(1), 7)
-    assert result["request_index"] == 7
+        return _gen()
+
+    return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
 
 
 async def test_benchmark_request_latency_is_positive() -> None:
@@ -104,6 +96,26 @@ async def test_benchmark_request_token_rate_uses_decode_time() -> None:
     assert abs(result["token_rate_tok_s"] - expected_rate) < 0.001
 
 
+async def test_benchmark_request_token_rate_nan_for_single_token() -> None:
+    # (completion_tokens - 1) == 0 → no decode tokens to measure a rate for
+    client = _make_client(
+        [
+            _make_chunk(content="Hi"),
+            _make_chunk(completion_tokens=1),
+        ]
+    )
+    result = await benchmark_request(client, "gpt-4o", "prompt", asyncio.Semaphore(1), 0)
+    assert result["completion_tokens"] == 1
+    assert math.isnan(result["token_rate_tok_s"])
+
+
+async def test_benchmark_request_ttft_nan_when_no_content_chunks() -> None:
+    # A stream with only a usage chunk (e.g. function-call response) has no content.
+    client = _make_client([_make_chunk(completion_tokens=5)])
+    result = await benchmark_request(client, "gpt-4o", "prompt", asyncio.Semaphore(1), 0)
+    assert math.isnan(result["ttft_s"])
+
+
 async def test_benchmark_request_ttft_ignores_empty_content_chunk() -> None:
     # First chunk from OpenAI carries role="assistant", content="" — not a real token.
     role_chunk = SimpleNamespace(
@@ -133,29 +145,18 @@ async def test_benchmark_request_no_error_on_success() -> None:
     assert result["error"] == ""
 
 
-async def test_benchmark_request_captures_error_message() -> None:
+async def test_benchmark_request_error_result() -> None:
     client = _make_error_client("connection refused")
     result = await benchmark_request(client, "gpt-4o", "prompt", asyncio.Semaphore(1), 0)
     assert result["error"] == "connection refused"
-
-
-async def test_benchmark_request_nan_metrics_on_error() -> None:
-    client = _make_error_client("timeout")
-    result = await benchmark_request(client, "gpt-4o", "prompt", asyncio.Semaphore(1), 0)
     assert math.isnan(result["latency_s"])
     assert math.isnan(result["ttft_s"])
     assert math.isnan(result["token_rate_tok_s"])
-
-
-async def test_benchmark_request_zero_tokens_on_error() -> None:
-    client = _make_error_client("timeout")
-    result = await benchmark_request(client, "gpt-4o", "prompt", asyncio.Semaphore(1), 0)
     assert result["completion_tokens"] == 0
 
 
 async def test_run_benchmark_result_count(monkeypatch: pytest.MonkeyPatch) -> None:
-    chunks = [_make_chunk(content="Hi"), _make_chunk(completion_tokens=1)]
-    instance = _make_patched_client(chunks)
+    instance = _make_client([_make_chunk(content="Hi"), _make_chunk(completion_tokens=1)])
     monkeypatch.setattr("runner.AsyncOpenAI", lambda **kwargs: instance)
 
     results = await run_benchmark(
@@ -171,8 +172,7 @@ async def test_run_benchmark_result_count(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 async def test_run_benchmark_contains_both_models(monkeypatch: pytest.MonkeyPatch) -> None:
-    chunks = [_make_chunk(content="Hi"), _make_chunk(completion_tokens=1)]
-    instance = _make_patched_client(chunks)
+    instance = _make_client([_make_chunk(content="Hi"), _make_chunk(completion_tokens=1)])
     monkeypatch.setattr("runner.AsyncOpenAI", lambda **kwargs: instance)
 
     results = await run_benchmark(
@@ -189,8 +189,7 @@ async def test_run_benchmark_contains_both_models(monkeypatch: pytest.MonkeyPatc
 
 
 async def test_run_benchmark_passes_base_url_and_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    chunks = [_make_chunk(content="Hi"), _make_chunk(completion_tokens=1)]
-    instance = _make_patched_client(chunks)
+    instance = _make_client([_make_chunk(content="Hi"), _make_chunk(completion_tokens=1)])
     captured: list[dict[str, str]] = []
 
     def fake_async_openai(**kwargs: str) -> Any:
@@ -214,8 +213,7 @@ async def test_run_benchmark_passes_base_url_and_key(monkeypatch: pytest.MonkeyP
 async def test_run_benchmark_prints_model_progress(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    chunks = [_make_chunk(content="Hi"), _make_chunk(completion_tokens=1)]
-    instance = _make_patched_client(chunks)
+    instance = _make_client([_make_chunk(content="Hi"), _make_chunk(completion_tokens=1)])
     monkeypatch.setattr("runner.AsyncOpenAI", lambda **kwargs: instance)
 
     await run_benchmark(
@@ -314,8 +312,10 @@ async def test_benchmark_request_no_retry_on_generic_error() -> None:
 
 
 async def test_run_benchmark_staggers_requests_by_delay(monkeypatch: pytest.MonkeyPatch) -> None:
-    chunks = [_make_chunk(content="Hi"), _make_chunk(completion_tokens=1)]
-    monkeypatch.setattr("runner.AsyncOpenAI", lambda **kwargs: _make_patched_client(chunks))
+    monkeypatch.setattr(
+        "runner.AsyncOpenAI",
+        lambda **kwargs: _make_ok_client(),
+    )
     sleep_calls: list[float] = []
 
     async def fake_sleep(s: float) -> None:
@@ -337,8 +337,10 @@ async def test_run_benchmark_staggers_requests_by_delay(monkeypatch: pytest.Monk
 
 
 async def test_run_benchmark_warmup_excluded_from_results(monkeypatch: pytest.MonkeyPatch) -> None:
-    chunks = [_make_chunk(content="Hi"), _make_chunk(completion_tokens=1)]
-    monkeypatch.setattr("runner.AsyncOpenAI", lambda **kwargs: _make_patched_client(chunks))
+    monkeypatch.setattr(
+        "runner.AsyncOpenAI",
+        lambda **kwargs: _make_ok_client(),
+    )
 
     results = await run_benchmark(
         base_url="http://localhost:4000",
@@ -356,8 +358,10 @@ async def test_run_benchmark_warmup_excluded_from_results(monkeypatch: pytest.Mo
 async def test_run_benchmark_warmup_request_indices_start_at_zero(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    chunks = [_make_chunk(content="Hi"), _make_chunk(completion_tokens=1)]
-    monkeypatch.setattr("runner.AsyncOpenAI", lambda **kwargs: _make_patched_client(chunks))
+    monkeypatch.setattr(
+        "runner.AsyncOpenAI",
+        lambda **kwargs: _make_ok_client(),
+    )
 
     results = await run_benchmark(
         base_url="http://localhost:4000",
@@ -374,12 +378,14 @@ async def test_run_benchmark_warmup_request_indices_start_at_zero(
 
 
 async def test_run_benchmark_no_sleep_on_zero_delay(monkeypatch: pytest.MonkeyPatch) -> None:
-    chunks = [_make_chunk(content="Hi"), _make_chunk(completion_tokens=1)]
-    monkeypatch.setattr("runner.AsyncOpenAI", lambda **kwargs: _make_patched_client(chunks))
+    monkeypatch.setattr(
+        "runner.AsyncOpenAI",
+        lambda **kwargs: _make_ok_client(),
+    )
     sleep_calls: list[float] = []
 
     async def fake_sleep(s: float) -> None:
-        sleep_calls.append(s)
+        sleep_calls.append(s)  # pragma: no cover — intentionally never reached with delay_s=0
 
     monkeypatch.setattr("runner.asyncio.sleep", fake_sleep)
 
@@ -421,37 +427,15 @@ async def test_benchmark_request_sends_unique_prompt_and_no_store() -> None:
 # --- Timeout tests ---
 
 
-async def test_benchmark_request_timeout_returns_nan_metrics() -> None:
-    async def create(**kwargs: Any) -> Any:
-        async def _gen() -> Any:
-            await asyncio.sleep(10)
-            yield _make_chunk(content="Hi")
-
-        return _gen()
-
-    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+async def test_benchmark_request_timeout_result() -> None:
     result = await benchmark_request(
-        client, "gpt-4o", "prompt", asyncio.Semaphore(1), 0, timeout_s=0.01
+        _make_slow_client(), "gpt-4o", "prompt", asyncio.Semaphore(1), 0, timeout_s=0.01
     )
+    assert "timeout" in result["error"].lower()
     assert math.isnan(result["latency_s"])
     assert math.isnan(result["ttft_s"])
     assert math.isnan(result["token_rate_tok_s"])
     assert result["completion_tokens"] == 0
-
-
-async def test_benchmark_request_timeout_error_message() -> None:
-    async def create(**kwargs: Any) -> Any:
-        async def _gen() -> Any:
-            await asyncio.sleep(10)
-            yield _make_chunk(content="Hi")
-
-        return _gen()
-
-    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
-    result = await benchmark_request(
-        client, "gpt-4o", "prompt", asyncio.Semaphore(1), 0, timeout_s=0.01
-    )
-    assert "timeout" in result["error"].lower()
 
 
 async def test_benchmark_request_timeout_not_retried() -> None:
@@ -463,7 +447,7 @@ async def test_benchmark_request_timeout_not_retried() -> None:
 
         async def _gen() -> Any:
             await asyncio.sleep(10)
-            yield _make_chunk(content="Hi")
+            yield _make_chunk(content="Hi")  # pragma: no cover
 
         return _gen()
 
@@ -513,15 +497,7 @@ async def test_benchmark_request_omits_max_tokens_when_none() -> None:
 
 
 async def test_run_benchmark_passes_timeout_to_requests(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def create(**kwargs: Any) -> Any:
-        async def _gen() -> Any:
-            await asyncio.sleep(10)
-            yield _make_chunk(content="Hi")
-
-        return _gen()
-
-    instance = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
-    monkeypatch.setattr("runner.AsyncOpenAI", lambda **kw: instance)
+    monkeypatch.setattr("runner.AsyncOpenAI", lambda **kw: _make_slow_client())
 
     results = await run_benchmark(
         base_url="http://localhost",

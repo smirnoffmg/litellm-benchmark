@@ -117,13 +117,35 @@ def test_main_calls_run_benchmark_and_writes_outputs(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr("main.write_chart", fake_write_chart)
     monkeypatch.setattr("main.write_percentile_chart", fake_write_percentile_chart)
 
-    main(["--model", "gpt-4o", "--requests", "1"])
+    main(
+        [
+            "--model",
+            "gpt-4o",
+            "--requests",
+            "1",
+            "--concurrency",
+            "3",
+            "--prompt",
+            "hello",
+            "--delay",
+            "0.5",
+            "--warmup",
+            "1",
+        ]
+    )
 
     assert len(run_calls) == 1
-    assert run_calls[0]["models"] == ["gpt-4o"]
-    assert run_calls[0]["base_url"] == "http://localhost:4000"
-    assert run_calls[0]["api_key"] == "sk-test"
-    assert run_calls[0]["n_requests"] == 1
+    kw = run_calls[0]
+    assert kw["models"] == ["gpt-4o"]
+    assert kw["base_url"] == "http://localhost:4000"
+    assert kw["api_key"] == "sk-test"
+    assert kw["n_requests"] == 1
+    assert kw["concurrency"] == 3
+    assert kw["prompt"] == "hello"
+    assert kw["delay_s"] == 0.5
+    assert kw["warmup"] == 1
+    assert kw["timeout_s"] == 60.0
+    assert kw["max_tokens"] is None
 
     assert csv_calls[0] == (fake_results, "results_20260615_120000.csv")
     assert summary_calls[0][1] == "results_20260615_120000_summary.csv"
