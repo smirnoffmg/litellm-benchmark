@@ -32,6 +32,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--warmup", type=int, default=3, metavar="N", help="Warmup requests per model (discarded)"
     )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=60.0,
+        metavar="SECONDS",
+        help="Per-request timeout in seconds (0 to disable)",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        dest="max_tokens",
+        metavar="N",
+        help="Max completion tokens per request (controls output length for fair comparison)",
+    )
     parser.add_argument("--output", default=None, help="CSV output path")
     parser.add_argument("--chart", default=None, help="Chart output path")
     return parser.parse_args(argv)
@@ -65,6 +80,8 @@ def main(argv: list[str] | None = None) -> None:
             prompt=args.prompt,
             delay_s=args.delay,
             warmup=args.warmup,
+            timeout_s=args.timeout,
+            max_tokens=args.max_tokens,
         )
     )
     write_csv(results, output)

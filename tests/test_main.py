@@ -159,3 +159,47 @@ def test_main_custom_output_overrides_timestamp(monkeypatch: pytest.MonkeyPatch)
 def test_parse_args_warmup_custom() -> None:
     ns = parse_args(["--model", "gpt-4o", "--warmup", "5"])
     assert ns.warmup == 5
+
+
+def test_parse_args_timeout_default() -> None:
+    ns = parse_args(["--model", "gpt-4o"])
+    assert ns.timeout == 60.0
+
+
+def test_parse_args_timeout_custom() -> None:
+    ns = parse_args(["--model", "gpt-4o", "--timeout", "30"])
+    assert ns.timeout == 30.0
+
+
+def test_parse_args_max_tokens_default() -> None:
+    ns = parse_args(["--model", "gpt-4o"])
+    assert ns.max_tokens is None
+
+
+def test_parse_args_max_tokens_custom() -> None:
+    ns = parse_args(["--model", "gpt-4o", "--max-tokens", "200"])
+    assert ns.max_tokens == 200
+
+
+def test_main_passes_timeout_and_max_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    from main import main
+
+    monkeypatch.setenv("LITELLM_BASE_URL", "http://localhost:4000")
+    monkeypatch.setenv("LITELLM_API_KEY", "sk-test")
+
+    run_calls: list[dict[str, Any]] = []
+
+    async def fake_run(**kwargs: Any) -> list[dict[str, Any]]:
+        run_calls.append(kwargs)
+        return []
+
+    monkeypatch.setattr("main.run_benchmark", fake_run)
+    monkeypatch.setattr("main.write_csv", lambda r, p: None)
+    monkeypatch.setattr("main.write_summary_csv", lambda r, p: None)
+    monkeypatch.setattr("main.write_chart", lambda r, p: None)
+    monkeypatch.setattr("main.write_percentile_chart", lambda r, p: None)
+
+    main(["--model", "gpt-4o", "--requests", "1", "--timeout", "45", "--max-tokens", "100"])
+
+    assert run_calls[0]["timeout_s"] == 45.0
+    assert run_calls[0]["max_tokens"] == 100

@@ -21,11 +21,14 @@ async def benchmark_request(
     prompt: str,
     semaphore: asyncio.Semaphore,
     request_index: int,
+    timeout_s: float = 60.0,
+    max_tokens: int | None = None,
 ) -> dict[str, Any]:
     async with semaphore:
         last_error = ""
         # Append index so identical prompts never hit LiteLLM's semantic cache.
         unique_prompt = f"{prompt} [req={request_index}]"
+        extra: dict[str, int] = {"max_tokens": max_tokens} if max_tokens is not None else {}
 
         for attempt in range(MAX_RETRIES + 1):
             start = time.perf_counter()
@@ -34,24 +37,37 @@ async def benchmark_request(
             first_chunk = True
 
             try:
-                stream = await client.chat.completions.create(
-                    model=model,
-                    messages=[{"role": "user", "content": unique_prompt}],
-                    stream=True,
-                    stream_options={"include_usage": True},
-                    extra_body={"no-store": True},  # bypass LiteLLM cache
-                )
-                async for chunk in stream:
-                    if first_chunk and chunk.choices and chunk.choices[0].delta.content:
-                        ttft_s = time.perf_counter() - start
-                        first_chunk = False
-                    if chunk.usage:
-                        completion_tokens = chunk.usage.completion_tokens or 0
+                async with asyncio.timeout(timeout_s if timeout_s > 0 else None):
+                    stream = await client.chat.completions.create(
+                        model=model,
+                        messages=[{"role": "user", "content": unique_prompt}],
+                        stream=True,
+                        stream_options={"include_usage": True},
+                        extra_body={"no-store": True},  # bypass LiteLLM cache
+                        **extra,
+                    )
+                    async for chunk in stream:
+                        if first_chunk and chunk.choices and chunk.choices[0].delta.content:
+                            ttft_s = time.perf_counter() - start
+                            first_chunk = False
+                        if chunk.usage:
+                            completion_tokens = chunk.usage.completion_tokens or 0
             except openai.RateLimitError as exc:
                 last_error = str(exc)
                 if attempt < MAX_RETRIES:
                     await asyncio.sleep(2**attempt)
                 continue
+            except TimeoutError:
+                return {
+                    "model": model,
+                    "request_index": request_index,
+                    "latency_s": float("nan"),
+                    "ttft_s": float("nan"),
+                    "completion_tokens": 0,
+                    "token_rate_tok_s": float("nan"),
+                    "error": f"timeout after {timeout_s}s",
+                    "retries": attempt,
+                }
             except Exception as exc:
                 return {
                     "model": model,
@@ -103,6 +119,8 @@ async def run_benchmark(
     prompt: str,
     delay_s: float = 1.0,
     warmup: int = 3,
+    timeout_s: float = 60.0,
+    max_tokens: int | None = None,
 ) -> list[dict[str, Any]]:
     client = AsyncOpenAI(base_url=base_url, api_key=api_key)
     semaphore = asyncio.Semaphore(concurrency)
@@ -110,7 +128,11 @@ async def run_benchmark(
     for model in models:
         if warmup > 0:
             warmup_tasks = [
-                asyncio.create_task(benchmark_request(client, model, prompt, semaphore, -(i + 1)))
+                asyncio.create_task(
+                    benchmark_request(
+                        client, model, prompt, semaphore, -(i + 1), timeout_s, max_tokens
+                    )
+                )
                 for i in range(warmup)
             ]
             await tqdm.gather(*warmup_tasks, desc=f"{model} [warmup]", unit="req")
@@ -119,7 +141,9 @@ async def run_benchmark(
             if i > 0 and delay_s > 0:
                 await asyncio.sleep(delay_s)
             tasks.append(
-                asyncio.create_task(benchmark_request(client, model, prompt, semaphore, i))
+                asyncio.create_task(
+                    benchmark_request(client, model, prompt, semaphore, i, timeout_s, max_tokens)
+                )
             )
         model_results = await tqdm.gather(*tasks, desc=model, unit="req")
         results.extend(model_results)

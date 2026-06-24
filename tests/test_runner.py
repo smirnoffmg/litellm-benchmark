@@ -416,3 +416,149 @@ async def test_benchmark_request_sends_unique_prompt_and_no_store() -> None:
     assert "hello" in msg_content
     assert "3" in msg_content, "request index must be embedded to bust the LiteLLM cache"
     assert captured[0].get("extra_body", {}).get("no-store") is True
+
+
+# --- Timeout tests ---
+
+
+async def test_benchmark_request_timeout_returns_nan_metrics() -> None:
+    async def create(**kwargs: Any) -> Any:
+        async def _gen() -> Any:
+            await asyncio.sleep(10)
+            yield _make_chunk(content="Hi")
+
+        return _gen()
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    result = await benchmark_request(
+        client, "gpt-4o", "prompt", asyncio.Semaphore(1), 0, timeout_s=0.01
+    )
+    assert math.isnan(result["latency_s"])
+    assert math.isnan(result["ttft_s"])
+    assert math.isnan(result["token_rate_tok_s"])
+    assert result["completion_tokens"] == 0
+
+
+async def test_benchmark_request_timeout_error_message() -> None:
+    async def create(**kwargs: Any) -> Any:
+        async def _gen() -> Any:
+            await asyncio.sleep(10)
+            yield _make_chunk(content="Hi")
+
+        return _gen()
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    result = await benchmark_request(
+        client, "gpt-4o", "prompt", asyncio.Semaphore(1), 0, timeout_s=0.01
+    )
+    assert "timeout" in result["error"].lower()
+
+
+async def test_benchmark_request_timeout_not_retried() -> None:
+    call_count = 0
+
+    async def create(**kwargs: Any) -> Any:
+        nonlocal call_count
+        call_count += 1
+
+        async def _gen() -> Any:
+            await asyncio.sleep(10)
+            yield _make_chunk(content="Hi")
+
+        return _gen()
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    result = await benchmark_request(
+        client, "gpt-4o", "prompt", asyncio.Semaphore(1), 0, timeout_s=0.01
+    )
+    assert call_count == 1
+    assert result["retries"] == 0
+
+
+# --- max_tokens tests ---
+
+
+async def test_benchmark_request_passes_max_tokens_when_set() -> None:
+    captured: list[dict[str, Any]] = []
+
+    async def create(**kwargs: Any) -> Any:
+        captured.append(kwargs)
+
+        async def _gen() -> Any:
+            yield _make_chunk(content="Hi")
+            yield _make_chunk(completion_tokens=1)
+
+        return _gen()
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    await benchmark_request(client, "gpt-4o", "prompt", asyncio.Semaphore(1), 0, max_tokens=128)
+    assert captured[0].get("max_tokens") == 128
+
+
+async def test_benchmark_request_omits_max_tokens_when_none() -> None:
+    captured: list[dict[str, Any]] = []
+
+    async def create(**kwargs: Any) -> Any:
+        captured.append(kwargs)
+
+        async def _gen() -> Any:
+            yield _make_chunk(content="Hi")
+            yield _make_chunk(completion_tokens=1)
+
+        return _gen()
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    await benchmark_request(client, "gpt-4o", "prompt", asyncio.Semaphore(1), 0, max_tokens=None)
+    assert "max_tokens" not in captured[0]
+
+
+async def test_run_benchmark_passes_timeout_to_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def create(**kwargs: Any) -> Any:
+        async def _gen() -> Any:
+            await asyncio.sleep(10)
+            yield _make_chunk(content="Hi")
+
+        return _gen()
+
+    instance = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    monkeypatch.setattr("runner.AsyncOpenAI", lambda **kw: instance)
+
+    results = await run_benchmark(
+        base_url="http://localhost",
+        api_key="k",
+        models=["m"],
+        concurrency=1,
+        n_requests=1,
+        prompt="p",
+        warmup=0,
+        timeout_s=0.01,
+    )
+    assert "timeout" in results[0]["error"].lower()
+
+
+async def test_run_benchmark_passes_max_tokens_to_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: list[dict[str, Any]] = []
+
+    async def create(**kwargs: Any) -> Any:
+        captured.append(kwargs)
+
+        async def _gen() -> Any:
+            yield _make_chunk(content="Hi")
+            yield _make_chunk(completion_tokens=1)
+
+        return _gen()
+
+    instance = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    monkeypatch.setattr("runner.AsyncOpenAI", lambda **kw: instance)
+
+    await run_benchmark(
+        base_url="http://localhost",
+        api_key="k",
+        models=["m"],
+        concurrency=1,
+        n_requests=1,
+        prompt="p",
+        warmup=0,
+        max_tokens=256,
+    )
+    assert captured[0].get("max_tokens") == 256

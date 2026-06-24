@@ -15,8 +15,10 @@ wheels/
 .ruff_cache/
 
 # Generated benchmark output
-results.csv
-chart.png
+results*.csv
+chart*.png
+percentile*.png
+*_summary.csv
 
 # Claude Code project settings
 .claude/
