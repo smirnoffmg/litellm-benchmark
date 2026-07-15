@@ -1,6 +1,8 @@
 # litellm-benchmark
 
-Benchmarks a [LiteLLM](https://github.com/BerriAI/litellm) proxy across one or more models, measuring latency, time to first token (TTFT), and token rate. Outputs a CSV, a summary CSV with percentiles, a time-series chart, and a percentile chart.
+Answers one question: **of the models behind my [LiteLLM](https://github.com/BerriAI/litellm) proxy, which one is fastest — and where does the time actually go?**
+
+Point it at your proxy, name the models, and it fires a batch of streaming requests at each. You get charts and CSVs breaking every response down into the three numbers that matter for user experience: how long until the answer is finished (**latency**), how long until the first word appears (**TTFT**), and how fast the words stream in after that (**token rate**).
 
 ## Example
 
@@ -8,67 +10,89 @@ Benchmarks a [LiteLLM](https://github.com/BerriAI/litellm) proxy across one or m
 
 ![chart2](./doc/img/example_2.png)
 
-## Install
+## Quick start
+
+You need Python 3.13+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync
-```
 
-## Configuration
-
-Set two environment variables before running:
-
-```bash
 export LITELLM_BASE_URL=http://localhost:4000
 export LITELLM_API_KEY=sk-your-key
-```
 
-## Usage
-
-```bash
-uv run python main.py \
+uv run litellm-benchmark \
   --model gpt-4o \
   --model claude-3-5-sonnet \
-  --concurrency 5 \
   --requests 20 \
-  --warmup 3 \
-  --prompt "Write a short poem about benchmarks"
+  --max-tokens 256
 ```
 
-Output files are named with a timestamp (`results_20260615_143022.csv`, etc.) so consecutive runs never overwrite each other. Pass `--output` / `--chart` to use fixed paths instead.
+That benchmarks both models with 20 timed requests each (plus 3 warmup requests that are discarded), then prints the paths of the four output files. `uv run python main.py` works too — same thing.
 
-| Flag            | Default                                 | Description                                   |
-| --------------- | --------------------------------------- | --------------------------------------------- |
-| `--model`       | *(required, repeatable)*                | Model name(s) to benchmark                    |
-| `--concurrency` | `5`                                     | Max concurrent requests per model             |
-| `--requests`    | `20`                                    | Timed requests per model (warmup not counted) |
-| `--warmup`      | `3`                                     | Warmup requests per model (results discarded) |
-| `--delay`       | `1.0`                                   | Seconds between request launches              |
-| `--prompt`      | `"Write a short poem about benchmarks"` | Prompt sent to each model                     |
-| `--output`      | `results_<timestamp>.csv`               | Raw CSV output path                           |
-| `--chart`       | `chart_<timestamp>.png`                 | Time-series chart path (PNG)                  |
+## What you get
 
-## Output
+Every run writes four timestamped files, so consecutive runs never overwrite each other:
 
-Four files are written per run:
+| File                       | What's inside                                                                                                   |
+| -------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `results_<ts>.csv`         | One row per request — raw material for your own analysis                                                        |
+| `results_<ts>_summary.csv` | p50 / p95 / p99 per model per metric                                                                            |
+| `chart_<ts>.png`           | Time-series chart: each metric over request index, with rolling mean, p50/p95 lines, and Smooth/Usable/Slow bands |
+| `percentile_<ts>.png`      | Bar chart comparing models at p50 / p95 / p99                                                                   |
 
-| File                       | Description                                                                                                                       |
-| -------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `results_<ts>.csv`         | One row per request: `model`, `request_index`, `latency_s`, `ttft_s`, `completion_tokens`, `token_rate_tok_s`, `error`, `retries` |
-| `results_<ts>_summary.csv` | p50 / p95 / p99 per model per metric                                                                                              |
-| `chart_<ts>.png`           | Time-series line chart (latency, TTFT, token rate over request index) with p50/p95 overlay lines and Smooth/Usable/Slow bands     |
-| `percentile_<ts>.png`      | Grouped bar chart: p50 / p80 / p95 per model per metric                                                                           |
+Raw CSV columns: `model`, `request_index`, `start_time` (seconds since benchmark start when the request began), `latency_s`, `ttft_s`, `completion_tokens`, `token_rate_tok_s`, `error`, `retries`.
 
-## Metrics
+Pass `--output` / `--chart` if you want fixed paths instead of timestamped ones.
 
-LLM inference has two distinct computational phases ([BentoML inference metrics](https://bentoml.com/llm/inference-optimization/llm-inference-metrics)):
+## Reading the results
+
+The three metrics correspond to what a person sitting in front of a chat UI experiences:
+
+- **TTFT (time to first token)** — the awkward silence before anything appears. Dominated by prompt processing.
+- **Token rate** — how fast the text streams once it starts. Below reading speed feels sluggish.
+- **Latency** — total time until the response is complete. What matters for non-interactive use (pipelines, agents).
+
+The time-series chart shades each plot into comfort bands so you can see at a glance whether a model feels good, tolerable, or painful:
+
+| Band       | Latency | TTFT  | Token rate  |
+| ---------- | ------- | ----- | ----------- |
+| 🟢 Smooth  | ≤ 5 s   | ≤ 2 s | ≥ 15 tok/s  |
+| 🟡 Usable  | 5–15 s  | 2–8 s | 7–15 tok/s  |
+| 🔴 Slow    | > 15 s  | > 8 s | < 7 tok/s   |
+
+TTFT and token rate are drawn on a log scale: values cluster near zero with occasional large spikes, and a linear axis would squash the interesting region flat.
+
+Percentiles over averages: p50 is the typical experience, p95 is what your unluckiest users get. A model with great p50 but terrible p95 will still generate complaints.
+
+## Flags
+
+| Flag            | Default                                 | Description                                    |
+| --------------- | --------------------------------------- | ---------------------------------------------- |
+| `--model`       | *(required, repeatable)*                | Model name(s) to benchmark                     |
+| `--concurrency` | `5`                                     | Max concurrent requests per model              |
+| `--requests`    | `20`                                    | Timed requests per model (warmup not counted)  |
+| `--warmup`      | `3`                                     | Warmup requests per model (results discarded)  |
+| `--delay`       | `1.0`                                   | Seconds between request launches               |
+| `--timeout`     | `60.0`                                  | Per-request timeout in seconds (`0` disables)  |
+| `--max-tokens`  | *(unset)*                               | Cap on completion tokens per request           |
+| `--prompt`      | `"Write a short poem about benchmarks"` | Prompt sent to each model                      |
+| `--output`      | `results_<timestamp>.csv`               | Raw CSV output path                            |
+| `--chart`       | `chart_<timestamp>.png`                 | Time-series chart path (PNG)                   |
+
+**Tips for meaningful numbers:**
+
+- **Comparing models? Set `--max-tokens`.** Without a fixed output length, a chatty model and a terse one produce token rates that aren't comparable — and TTFT comparisons need the same prompt for the same reason.
+- **Measuring throughput? Set `--delay 0`.** The default 1-second stagger is gentle load-shaping; with fast models each request finishes before the next launches, so concurrency never actually builds up.
+- **Watch the `retries` column.** Non-zero means the proxy returned HTTP 429 during the run, and reported latencies are understated relative to a client without retry logic.
+
+## How it works
+
+Each request streams the response (`stream=true`) so the phases of LLM inference can be timed separately. Inference has two distinct phases ([BentoML inference metrics](https://bentoml.com/llm/inference-optimization/llm-inference-metrics)):
 
 1. **Prefill** — the model processes the entire prompt in one forward pass and builds the KV cache. Duration scales with prompt length. No tokens are emitted yet.
 2. **Decode** — the model autoregressively samples one token at a time, reusing the KV cache. Duration scales with output length.
 
-### Measurement overview
-
-The following diagram shows where each clock reading is taken during a single streaming request:
+The diagram shows where each clock reading is taken:
 
 ```mermaid
 flowchart LR
@@ -85,7 +109,7 @@ flowchart LR
     A -. "latency_s" .-> E
 ```
 
-The sequence below shows exactly what arrives over the wire and when each measurement is recorded:
+And the wire-level view of a single request:
 
 ```mermaid
 sequenceDiagram
@@ -151,6 +175,22 @@ token_rate_tok_s = (completion_tokens − 1) / (latency_s − ttft_s)
 
 The `− 1` accounts for the first token being already captured by `ttft_s`; the remaining `completion_tokens − 1` tokens are produced during the decode window `latency_s − ttft_s`. Using total `latency_s` as the denominator would dilute the rate with prefill time and make it prompt-length-dependent. Returns `nan` when output is ≤ 1 token or the decode window is zero.
 
-### `retries`
+### Retries and caching
 
-Number of HTTP 429 responses received before the request succeeded (or was abandoned). Requests are retried up to 3 times with exponential backoff: 1 s, 2 s, 4 s. A non-zero value means the proxy was rate-limiting during the run and the reported latency is understated relative to what a client without retry logic would see.
+Requests hitting HTTP 429 are retried up to 3 times with exponential backoff (1 s, 2 s, 4 s); the `retries` column records the count. Two measures keep LiteLLM's cache from serving canned answers: each prompt gets a unique `[req=N]` suffix, and requests carry `no-store: true`.
+
+## Known limitations
+
+- **Models run sequentially, not interleaved.** Model A finishes all its requests before model B starts, so the second model runs against a warmer proxy/backend. Per-model warmup requests soften this, but for a rigorous head-to-head, run the benchmark twice with the model order swapped.
+- **Retried requests time only the last attempt.** The latency of a request that got rate-limited reflects the attempt that succeeded, not the total time including backoff.
+
+## Development
+
+```bash
+uv run pytest -m "not integration"   # unit tests
+uv run ruff check . && uv run ruff format --check .
+uv run mypy .                        # strict mode
+uv run pytest -m integration         # needs a local Ollama instance
+```
+
+CI runs lint, format, types, and unit tests on every push and PR.

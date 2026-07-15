@@ -29,6 +29,8 @@ def test_full_pipeline_against_ollama(
     assert row["latency_s"] > 0
     assert row["ttft_s"] > 0
     assert row["completion_tokens"] > 0
+    assert row["token_rate_tok_s"] > 0
+    assert row["start_time"] >= 0
 
     csv_path = str(tmp_path / "results.csv")
     chart_path = str(tmp_path / "chart.png")

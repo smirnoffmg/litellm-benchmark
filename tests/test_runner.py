@@ -1,5 +1,6 @@
 import asyncio
 import math
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -166,6 +167,7 @@ async def test_run_benchmark_result_count(monkeypatch: pytest.MonkeyPatch) -> No
         concurrency=2,
         n_requests=3,
         prompt="test",
+        delay_s=0.0,
     )
 
     assert len(results) == 6
@@ -182,6 +184,7 @@ async def test_run_benchmark_contains_both_models(monkeypatch: pytest.MonkeyPatc
         concurrency=1,
         n_requests=2,
         prompt="test",
+        delay_s=0.0,
     )
 
     models_in_results = {r["model"] for r in results}
@@ -205,6 +208,7 @@ async def test_run_benchmark_passes_base_url_and_key(monkeypatch: pytest.MonkeyP
         concurrency=1,
         n_requests=1,
         prompt="test",
+        delay_s=0.0,
     )
 
     assert captured == [{"base_url": "http://my-proxy:4000", "api_key": "sk-secret"}]
@@ -223,6 +227,7 @@ async def test_run_benchmark_prints_model_progress(
         concurrency=1,
         n_requests=1,
         prompt="test",
+        delay_s=0.0,
     )
 
     err = capsys.readouterr().err
@@ -331,9 +336,33 @@ async def test_run_benchmark_staggers_requests_by_delay(monkeypatch: pytest.Monk
         n_requests=3,
         prompt="p",
         delay_s=1.5,
+        warmup=0,
     )
 
     assert sleep_calls == [1.5, 1.5]  # n_requests-1 sleeps, no sleep before request 0
+
+
+async def test_run_benchmark_staggers_warmup_by_delay(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("runner.AsyncOpenAI", lambda **kwargs: _make_ok_client())
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(s: float) -> None:
+        sleep_calls.append(s)
+
+    monkeypatch.setattr("runner.asyncio.sleep", fake_sleep)
+
+    await run_benchmark(
+        base_url="http://localhost",
+        api_key="k",
+        models=["m"],
+        concurrency=5,
+        n_requests=1,
+        prompt="p",
+        delay_s=1.5,
+        warmup=3,
+    )
+
+    assert sleep_calls == [1.5, 1.5]  # warmup-1 sleeps; single timed request adds none
 
 
 async def test_run_benchmark_warmup_excluded_from_results(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -349,6 +378,7 @@ async def test_run_benchmark_warmup_excluded_from_results(monkeypatch: pytest.Mo
         concurrency=1,
         n_requests=3,
         prompt="test",
+        delay_s=0.0,
         warmup=2,
     )
 
@@ -370,6 +400,7 @@ async def test_run_benchmark_warmup_request_indices_start_at_zero(
         concurrency=1,
         n_requests=2,
         prompt="test",
+        delay_s=0.0,
         warmup=2,
     )
 
@@ -422,6 +453,83 @@ async def test_benchmark_request_sends_unique_prompt_and_no_store() -> None:
     assert "hello" in msg_content
     assert "3" in msg_content, "request index must be embedded to bust the LiteLLM cache"
     assert captured[0].get("extra_body", {}).get("no-store") is True
+
+
+# --- start_time tests ---
+
+
+async def test_benchmark_request_start_time_relative_to_bench_start() -> None:
+    bench_start = time.perf_counter() - 5.0
+    result = await benchmark_request(
+        _make_ok_client(), "gpt-4o", "prompt", asyncio.Semaphore(1), 0, bench_start=bench_start
+    )
+    assert result["start_time"] >= 5.0
+    assert result["start_time"] < 6.0
+
+
+async def test_benchmark_request_start_time_zero_without_bench_start() -> None:
+    result = await benchmark_request(_make_ok_client(), "gpt-4o", "prompt", asyncio.Semaphore(1), 0)
+    assert result["start_time"] == 0.0
+
+
+async def test_benchmark_request_start_time_present_on_timeout() -> None:
+    bench_start = time.perf_counter()
+    result = await benchmark_request(
+        _make_slow_client(),
+        "gpt-4o",
+        "prompt",
+        asyncio.Semaphore(1),
+        0,
+        timeout_s=0.01,
+        bench_start=bench_start,
+    )
+    assert result["start_time"] >= 0.0
+
+
+async def test_benchmark_request_start_time_present_on_error() -> None:
+    result = await benchmark_request(
+        _make_error_client("boom"),
+        "gpt-4o",
+        "prompt",
+        asyncio.Semaphore(1),
+        0,
+        bench_start=time.perf_counter(),
+    )
+    assert result["start_time"] >= 0.0
+
+
+async def test_benchmark_request_start_time_present_on_exhausted_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _no_sleep(monkeypatch)
+    result = await benchmark_request(
+        _make_always_rate_limit_client(),
+        "gpt-4o",
+        "prompt",
+        asyncio.Semaphore(1),
+        0,
+        bench_start=time.perf_counter(),
+    )
+    assert result["start_time"] >= 0.0
+
+
+async def test_run_benchmark_start_times_are_monotonic(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("runner.AsyncOpenAI", lambda **kw: _make_ok_client())
+
+    results = await run_benchmark(
+        base_url="http://localhost",
+        api_key="k",
+        models=["m"],
+        concurrency=1,
+        n_requests=3,
+        prompt="p",
+        delay_s=0.0,
+        warmup=0,
+    )
+
+    start_times = [r["start_time"] for r in sorted(results, key=lambda r: r["request_index"])]
+    assert all(t >= 0.0 for t in start_times)
+    assert start_times == sorted(start_times)
 
 
 # --- Timeout tests ---

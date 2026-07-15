@@ -23,8 +23,10 @@ async def benchmark_request(
     request_index: int,
     timeout_s: float = 60.0,
     max_tokens: int | None = None,
+    bench_start: float | None = None,
 ) -> dict[str, Any]:
     async with semaphore:
+        start_time = time.perf_counter() - bench_start if bench_start is not None else 0.0
         last_error = ""
         # Append index so identical prompts never hit LiteLLM's semantic cache.
         unique_prompt = f"{prompt} [req={request_index}]"
@@ -61,6 +63,7 @@ async def benchmark_request(
                 return {
                     "model": model,
                     "request_index": request_index,
+                    "start_time": start_time,
                     "latency_s": float("nan"),
                     "ttft_s": float("nan"),
                     "completion_tokens": 0,
@@ -72,6 +75,7 @@ async def benchmark_request(
                 return {
                     "model": model,
                     "request_index": request_index,
+                    "start_time": start_time,
                     "latency_s": float("nan"),
                     "ttft_s": float("nan"),
                     "completion_tokens": 0,
@@ -90,6 +94,7 @@ async def benchmark_request(
             return {
                 "model": model,
                 "request_index": request_index,
+                "start_time": start_time,
                 "latency_s": latency_s,
                 "ttft_s": ttft_s,
                 "completion_tokens": completion_tokens,
@@ -101,6 +106,7 @@ async def benchmark_request(
         return {
             "model": model,
             "request_index": request_index,
+            "start_time": start_time,
             "latency_s": float("nan"),
             "ttft_s": float("nan"),
             "completion_tokens": 0,
@@ -124,17 +130,21 @@ async def run_benchmark(
 ) -> list[dict[str, Any]]:
     client = AsyncOpenAI(base_url=base_url, api_key=api_key)
     semaphore = asyncio.Semaphore(concurrency)
+    bench_start = time.perf_counter()
     results: list[dict[str, Any]] = []
     for model in models:
         if warmup > 0:
-            warmup_tasks = [
-                asyncio.create_task(
-                    benchmark_request(
-                        client, model, prompt, semaphore, -(i + 1), timeout_s, max_tokens
+            warmup_tasks = []
+            for i in range(warmup):
+                if i > 0 and delay_s > 0:
+                    await asyncio.sleep(delay_s)
+                warmup_tasks.append(
+                    asyncio.create_task(
+                        benchmark_request(
+                            client, model, prompt, semaphore, -(i + 1), timeout_s, max_tokens
+                        )
                     )
                 )
-                for i in range(warmup)
-            ]
             await tqdm.gather(*warmup_tasks, desc=f"{model} [warmup]", unit="req")
         tasks: list[asyncio.Task[dict[str, Any]]] = []
         for i in range(n_requests):
@@ -142,7 +152,9 @@ async def run_benchmark(
                 await asyncio.sleep(delay_s)
             tasks.append(
                 asyncio.create_task(
-                    benchmark_request(client, model, prompt, semaphore, i, timeout_s, max_tokens)
+                    benchmark_request(
+                        client, model, prompt, semaphore, i, timeout_s, max_tokens, bench_start
+                    )
                 )
             )
         model_results = await tqdm.gather(*tasks, desc=model, unit="req")
