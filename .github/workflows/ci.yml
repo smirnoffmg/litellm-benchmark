@@ -29,3 +29,4 @@ jobs:
           enable-cache: true
       - run: uv sync --frozen --group dev
       - run: uv run pytest -m "not integration" -v
+      - run: uv run litellm-benchmark --help

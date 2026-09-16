@@ -433,7 +433,7 @@ async def test_run_benchmark_no_sleep_on_zero_delay(monkeypatch: pytest.MonkeyPa
     assert sleep_calls == []
 
 
-async def test_benchmark_request_sends_unique_prompt_and_no_store() -> None:
+async def test_benchmark_request_sends_unique_prompt_and_disables_cache() -> None:
     captured: list[dict[str, Any]] = []
 
     async def create(**kwargs: Any) -> Any:
@@ -452,7 +452,8 @@ async def test_benchmark_request_sends_unique_prompt_and_no_store() -> None:
     msg_content = captured[0]["messages"][0]["content"]
     assert "hello" in msg_content
     assert "3" in msg_content, "request index must be embedded to bust the LiteLLM cache"
-    assert captured[0].get("extra_body", {}).get("no-store") is True
+    # LiteLLM reads cache controls only when nested under "cache"; no-cache skips lookup.
+    assert captured[0]["extra_body"] == {"cache": {"no-cache": True, "no-store": True}}
 
 
 # --- start_time tests ---
@@ -540,7 +541,7 @@ async def test_benchmark_request_timeout_result() -> None:
         _make_slow_client(), "gpt-4o", "prompt", asyncio.Semaphore(1), 0, timeout_s=0.01
     )
     assert "timeout" in result["error"].lower()
-    assert math.isnan(result["latency_s"])
+    assert result["latency_s"] >= 0.01
     assert math.isnan(result["ttft_s"])
     assert math.isnan(result["token_rate_tok_s"])
     assert result["completion_tokens"] == 0
@@ -646,3 +647,242 @@ async def test_run_benchmark_passes_max_tokens_to_requests(monkeypatch: pytest.M
         max_tokens=256,
     )
     assert captured[0].get("max_tokens") == 256
+
+
+# --- Queue wait and retry backoff are part of latency ---
+
+
+async def test_benchmark_request_latency_includes_queue_wait() -> None:
+    semaphore = asyncio.Semaphore(1)
+    await semaphore.acquire()
+    task = asyncio.create_task(benchmark_request(_make_ok_client(), "m", "p", semaphore, 0))
+    await asyncio.sleep(0.05)
+    semaphore.release()
+    result = await task
+
+    assert result["queue_s"] >= 0.05
+    assert result["ttft_s"] >= result["queue_s"]
+    assert result["latency_s"] >= result["queue_s"]
+
+
+async def test_benchmark_request_queue_s_zero_ish_without_contention() -> None:
+    result = await benchmark_request(_make_ok_client(), "m", "p", asyncio.Semaphore(1), 0)
+    assert 0.0 <= result["queue_s"] < 0.05
+
+
+async def test_benchmark_request_start_time_recorded_before_queue() -> None:
+    bench_start = time.perf_counter()
+    semaphore = asyncio.Semaphore(1)
+    await semaphore.acquire()
+    task = asyncio.create_task(
+        benchmark_request(_make_ok_client(), "m", "p", semaphore, 0, bench_start=bench_start)
+    )
+    await asyncio.sleep(0.05)
+    semaphore.release()
+    result = await task
+
+    assert result["start_time"] < 0.05
+
+
+async def test_benchmark_request_latency_includes_retry_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_sleep = asyncio.sleep
+
+    async def short_sleep(_: float) -> None:
+        await real_sleep(0.05)
+
+    monkeypatch.setattr(asyncio, "sleep", short_sleep)
+    chunks = [_make_chunk(content="Hi"), _make_chunk(completion_tokens=1)]
+    result = await benchmark_request(
+        _make_flaky_client(1, chunks), "m", "p", asyncio.Semaphore(1), 0
+    )
+
+    assert result["retries"] == 1
+    assert result["ttft_s"] >= 0.05
+    assert result["latency_s"] >= 0.05
+
+
+async def test_benchmark_request_queue_s_present_on_error() -> None:
+    result = await benchmark_request(_make_error_client("boom"), "m", "p", asyncio.Semaphore(1), 0)
+    assert result["queue_s"] >= 0.0
+
+
+# --- Model interleaving ---
+
+
+def _make_recording_client(log: list[str]) -> Any:
+    async def create(**kwargs: Any) -> Any:
+        log.append(kwargs["model"])
+
+        async def _gen() -> Any:
+            yield _make_chunk(content="Hi")
+            yield _make_chunk(completion_tokens=1)
+
+        return _gen()
+
+    return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+
+
+async def test_run_benchmark_interleaves_models(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr("runner.AsyncOpenAI", lambda **kw: _make_recording_client(calls))
+
+    await run_benchmark(
+        base_url="http://localhost",
+        api_key="k",
+        models=["a", "b"],
+        concurrency=5,
+        n_requests=2,
+        prompt="p",
+        delay_s=0.0,
+        warmup=0,
+    )
+
+    assert calls == ["a", "b", "a", "b"]
+
+
+async def test_run_benchmark_concurrency_limit_is_per_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    in_flight: dict[str, int] = {"a": 0, "b": 0}
+    peak: dict[str, int] = {"a": 0, "b": 0}
+    peak_total = 0
+
+    async def create(**kwargs: Any) -> Any:
+        nonlocal peak_total
+        model = kwargs["model"]
+        in_flight[model] += 1
+        peak[model] = max(peak[model], in_flight[model])
+        peak_total = max(peak_total, sum(in_flight.values()))
+
+        async def _gen() -> Any:
+            await asyncio.sleep(0.01)
+            in_flight[model] -= 1
+            yield _make_chunk(content="Hi")
+            yield _make_chunk(completion_tokens=1)
+
+        return _gen()
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    monkeypatch.setattr("runner.AsyncOpenAI", lambda **kw: client)
+
+    await run_benchmark(
+        base_url="http://localhost",
+        api_key="k",
+        models=["a", "b"],
+        concurrency=1,
+        n_requests=3,
+        prompt="p",
+        delay_s=0.0,
+        warmup=0,
+    )
+
+    assert peak == {"a": 1, "b": 1}
+    assert peak_total == 2
+
+
+# --- Sequential mode ---
+
+
+def _make_prompt_recording_client(log: list[tuple[str, str]]) -> Any:
+    async def create(**kwargs: Any) -> Any:
+        content = kwargs["messages"][0]["content"]
+        log.append((kwargs["model"], content[content.index("[req=") :]))
+
+        async def _gen() -> Any:
+            yield _make_chunk(content="Hi")
+            yield _make_chunk(completion_tokens=1)
+
+        return _gen()
+
+    return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+
+
+async def test_run_benchmark_sequential_warms_each_model_right_before_its_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # On a shared local backend, warming B before A runs is wasted: A evicts B.
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr("runner.AsyncOpenAI", lambda **kw: _make_prompt_recording_client(calls))
+
+    await run_benchmark(
+        base_url="http://localhost",
+        api_key="k",
+        models=["a", "b"],
+        concurrency=5,
+        n_requests=2,
+        prompt="p",
+        delay_s=0.0,
+        warmup=1,
+        sequential=True,
+    )
+
+    assert calls == [
+        ("a", "[req=-1]"),
+        ("a", "[req=0]"),
+        ("a", "[req=1]"),
+        ("b", "[req=-1]"),
+        ("b", "[req=0]"),
+        ("b", "[req=1]"),
+    ]
+
+
+async def test_run_benchmark_interleaved_warms_all_models_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr("runner.AsyncOpenAI", lambda **kw: _make_prompt_recording_client(calls))
+
+    await run_benchmark(
+        base_url="http://localhost",
+        api_key="k",
+        models=["a", "b"],
+        concurrency=5,
+        n_requests=1,
+        prompt="p",
+        delay_s=0.0,
+        warmup=1,
+    )
+
+    assert calls == [("a", "[req=-1]"), ("b", "[req=-1]"), ("a", "[req=0]"), ("b", "[req=0]")]
+
+
+async def test_run_benchmark_sequential_models_never_overlap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    in_flight: dict[str, int] = {"a": 0, "b": 0}
+    overlap = False
+
+    async def create(**kwargs: Any) -> Any:
+        nonlocal overlap
+        model = kwargs["model"]
+        in_flight[model] += 1
+        other = "b" if model == "a" else "a"
+        overlap = overlap or in_flight[other] > 0
+
+        async def _gen() -> Any:
+            await asyncio.sleep(0.01)
+            in_flight[model] -= 1
+            yield _make_chunk(content="Hi")
+            yield _make_chunk(completion_tokens=1)
+
+        return _gen()
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    monkeypatch.setattr("runner.AsyncOpenAI", lambda **kw: client)
+
+    results = await run_benchmark(
+        base_url="http://localhost",
+        api_key="k",
+        models=["a", "b"],
+        concurrency=3,
+        n_requests=3,
+        prompt="p",
+        delay_s=0.0,
+        warmup=1,
+        sequential=True,
+    )
+
+    assert not overlap
+    assert [r["model"] for r in results] == ["a", "a", "a", "b", "b", "b"]

@@ -22,10 +22,11 @@ def write_summary_csv(results: list[dict[str, Any]], path: str) -> None:
     metrics = ["latency_s", "ttft_s", "token_rate_tok_s"]
     rows = []
     for model, grp in df.groupby("model"):
+        error_rate = grp["error"].fillna("").astype(str).ne("").mean()
         for metric in metrics:
             col = grp[metric].dropna()
             rows.append(
-                {"model": model, "metric": metric}
+                {"model": model, "metric": metric, "n": len(col), "error_rate": error_rate}
                 | {label: col.quantile(q) for label, q in _PERCENTILE_DEFS}
             )
     pd.DataFrame(rows).to_csv(path, index=False)

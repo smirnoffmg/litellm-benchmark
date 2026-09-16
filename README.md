@@ -36,11 +36,11 @@ Every run writes four timestamped files, so consecutive runs never overwrite eac
 | File                       | What's inside                                                                                                   |
 | -------------------------- | --------------------------------------------------------------------------------------------------------------- |
 | `results_<ts>.csv`         | One row per request — raw material for your own analysis                                                        |
-| `results_<ts>_summary.csv` | p50 / p95 / p99 per model per metric                                                                            |
+| `results_<ts>_summary.csv` | p50 / p95 / p99 per model per metric, plus sample count `n` and the model's `error_rate`                         |
 | `chart_<ts>.png`           | Time-series chart: each metric over request index, with rolling mean, p50/p95 lines, and Smooth/Usable/Slow bands |
 | `percentile_<ts>.png`      | Bar chart comparing models at p50 / p95 / p99                                                                   |
 
-Raw CSV columns: `model`, `request_index`, `start_time` (seconds since benchmark start when the request began), `latency_s`, `ttft_s`, `completion_tokens`, `token_rate_tok_s`, `error`, `retries`.
+Raw CSV columns: `model`, `request_index`, `start_time` (seconds since the benchmark started, warmup included, when this request was launched), `queue_s` (time spent waiting for a concurrency slot), `latency_s`, `ttft_s`, `completion_tokens`, `token_rate_tok_s`, `error`, `retries`.
 
 Pass `--output` / `--chart` if you want fixed paths instead of timestamped ones.
 
@@ -48,7 +48,7 @@ Pass `--output` / `--chart` if you want fixed paths instead of timestamped ones.
 
 The three metrics correspond to what a person sitting in front of a chat UI experiences:
 
-- **TTFT (time to first token)** — the awkward silence before anything appears. Dominated by prompt processing.
+- **TTFT (time to first token)** — the awkward silence before anything appears. Dominated by prompt processing. For reasoning models, hidden thinking tokens (`reasoning_content`) don't count, so TTFT includes the whole thinking phase.
 - **Token rate** — how fast the text streams once it starts. Below reading speed feels sluggish.
 - **Latency** — total time until the response is complete. What matters for non-interactive use (pipelines, agents).
 
@@ -62,7 +62,9 @@ The time-series chart shades each plot into comfort bands so you can see at a gl
 
 TTFT and token rate are drawn on a log scale: values cluster near zero with occasional large spikes, and a linear axis would squash the interesting region flat.
 
-Percentiles over averages: p50 is the typical experience, p95 is what your unluckiest users get. A model with great p50 but terrible p95 will still generate complaints.
+Percentiles over averages: p50 is the typical experience, p95 is what your unluckiest users get. A model with great p50 but terrible p95 will still generate complaints. With fewer than ~100 requests per model, p99 is effectively the single worst sample; the tool warns about this after the run.
+
+Failures are not silently dropped: a timed-out request is recorded with the time it waited (a lower bound on its true latency), so timeouts show up in the latency tail. Other errors carry no timings and are counted in `error_rate` instead.
 
 ## Flags
 
@@ -72,18 +74,19 @@ Percentiles over averages: p50 is the typical experience, p95 is what your unluc
 | `--concurrency` | `5`                                     | Max concurrent requests per model              |
 | `--requests`    | `20`                                    | Timed requests per model (warmup not counted)  |
 | `--warmup`      | `3`                                     | Warmup requests per model (results discarded)  |
-| `--delay`       | `1.0`                                   | Seconds between request launches               |
+| `--delay`       | `1.0`                                   | Seconds between request launches (all models)  |
 | `--timeout`     | `60.0`                                  | Per-request timeout in seconds (`0` disables)  |
 | `--max-tokens`  | *(unset)*                               | Cap on completion tokens per request           |
 | `--prompt`      | `"Write a short poem about benchmarks"` | Prompt sent to each model                      |
+| `--sequential`  | *(off)*                                 | Run models one after another instead of interleaving |
 | `--output`      | `results_<timestamp>.csv`               | Raw CSV output path                            |
-| `--chart`       | `chart_<timestamp>.png`                 | Time-series chart path (PNG)                   |
+| `--chart`       | `chart_<timestamp>.png`                 | Time-series chart path (PNG); the percentile chart goes next to it as `<name>_percentile.png` |
 
 **Tips for meaningful numbers:**
 
 - **Comparing models? Set `--max-tokens`.** Without a fixed output length, a chatty model and a terse one produce token rates that aren't comparable — and TTFT comparisons need the same prompt for the same reason.
 - **Measuring throughput? Set `--delay 0`.** The default 1-second stagger is gentle load-shaping; with fast models each request finishes before the next launches, so concurrency never actually builds up.
-- **Watch the `retries` column.** Non-zero means the proxy returned HTTP 429 during the run, and reported latencies are understated relative to a client without retry logic.
+- **Watch `queue_s` and `retries`.** A growing `queue_s` means requests arrive faster than `--concurrency` lets them through; non-zero `retries` means the proxy returned HTTP 429. Both waits are included in `latency_s` and `ttft_s`, because a caller experiences them too.
 
 ## How it works
 
@@ -96,7 +99,7 @@ The diagram shows where each clock reading is taken:
 
 ```mermaid
 flowchart LR
-    A(["t_request\nperf_counter()"])
+    A(["t_submit\nperf_counter()\nbefore concurrency slot"])
     B["Prefill\nprompt → KV cache\nscales with prompt length"]
     C(["t_first_token\nfirst non-empty chunk"])
     D["Decode\nautoregressive sampling\nscales with output length"]
@@ -117,8 +120,8 @@ sequenceDiagram
     participant P as LiteLLM proxy
     participant M as Model
 
-    B->>P: POST /v1/chat/completions<br/>(stream=true, no-store=true)
-    note over B: t_request ← perf_counter()
+    note over B: t_submit ← perf_counter()<br/>then wait for a concurrency slot (queue_s)
+    B->>P: POST /v1/chat/completions<br/>(stream=true, cache: no-cache + no-store)
     P->>M: forward
 
     note over M: Prefill phase —<br/>processes entire prompt,<br/>builds KV cache
@@ -129,7 +132,7 @@ sequenceDiagram
 
     M-->>P: chunk {content:"Hello"}
     P-->>B: chunk {content:"Hello"}
-    note over B: ttft_s ← perf_counter() − t_request
+    note over B: ttft_s ← perf_counter() − t_submit
 
     loop Decode — one token per iteration
         M-->>P: chunk {content:"…"}
@@ -138,21 +141,21 @@ sequenceDiagram
 
     M-->>P: chunk {usage:{completion_tokens: N}}
     P-->>B: chunk {usage:{completion_tokens: N}}
-    note over B: latency_s ← perf_counter() − t_request
+    note over B: latency_s ← perf_counter() − t_submit
 ```
 
 ### `latency_s`
 
 ```
-latency_s = t_last_chunk − t_request
+latency_s = t_last_chunk − t_submit
 ```
 
-End-to-end wall time. Includes both phases plus network round-trip. Useful for user-facing SLA budgets.
+End-to-end wall time. Includes both phases, network round-trip, and any client-side wait: queueing for a concurrency slot and 429 backoff. The clock starts when the request is launched, not when it is sent. Otherwise a saturated proxy would look fast, because the slow part would be spent in the client's queue (the "coordinated omission" problem; Kleppmann, *Designing Data-Intensive Applications*, p. 14). Useful for user-facing SLA budgets.
 
 ### `ttft_s` — Time to First Token
 
 ```
-ttft_s = t_first_content_chunk − t_request
+ttft_s = t_first_content_chunk − t_submit
 ```
 
 Time until the server emits the first real content token. Dominated by the prefill phase, so it scales with prompt length — TTFT benchmarks without a fixed prompt length are not comparable ([DigitalOcean benchmarking guide](https://www.digitalocean.com/blog/llm-inference-benchmarking)).
@@ -173,16 +176,24 @@ TPOT = (latency_s − ttft_s) / (completion_tokens − 1)
 token_rate_tok_s = (completion_tokens − 1) / (latency_s − ttft_s)
 ```
 
-The `− 1` accounts for the first token being already captured by `ttft_s`; the remaining `completion_tokens − 1` tokens are produced during the decode window `latency_s − ttft_s`. Using total `latency_s` as the denominator would dilute the rate with prefill time and make it prompt-length-dependent. Returns `nan` when output is ≤ 1 token or the decode window is zero.
+The `− 1` accounts for the first token being already captured by `ttft_s`; the remaining `completion_tokens − 1` tokens are produced during the decode window `latency_s − ttft_s`. Using total `latency_s` as the denominator would dilute the rate with prefill time and make it prompt-length-dependent. Returns `nan` when output is ≤ 1 token or the decode window is zero. Queue and backoff time cancel out in `latency_s − ttft_s`, so the rate reflects decoding only.
 
 ### Retries and caching
 
-Requests hitting HTTP 429 are retried up to 3 times with exponential backoff (1 s, 2 s, 4 s); the `retries` column records the count. Two measures keep LiteLLM's cache from serving canned answers: each prompt gets a unique `[req=N]` suffix, and requests carry `no-store: true`.
+Requests hitting HTTP 429 are retried up to 3 times with exponential backoff (1 s, 2 s, 4 s); the `retries` column records the count. Two measures keep LiteLLM's cache from serving canned answers: each prompt gets a unique `[req=N]` suffix, and requests carry `"cache": {"no-cache": true, "no-store": true}` ([LiteLLM cache controls](https://docs.litellm.ai/docs/proxy/caching_controls): the controls must be nested under `cache`; `no-cache` skips lookup, `no-store` skips writing).
+
+### Load pattern
+
+Each model gets its own warmup, then timed requests are launched round-robin across models (`a, b, a, b, …`), `--delay` seconds apart. Launches don't wait for earlier responses, so a slow model builds a queue instead of quietly slowing the load down. Interleaving means that any drift in backend load affects all models equally. `--concurrency` is a separate limit for each model.
+
+Interleaving assumes the models don't share hardware, which holds for a LiteLLM proxy in front of different providers. When they do share it (several models in one local Ollama), they end up waiting on each other and the model that starts second looks slow for no reason of its own. Use `--sequential` in that case: each model is warmed up and benchmarked on its own, and the next model starts only after the previous one finishes.
 
 ## Known limitations
 
-- **Models run sequentially, not interleaved.** Model A finishes all its requests before model B starts, so the second model runs against a warmer proxy/backend. Per-model warmup requests soften this, but for a rigorous head-to-head, run the benchmark twice with the model order swapped.
-- **Retried requests time only the last attempt.** The latency of a request that got rate-limited reflects the attempt that succeeded, not the total time including backoff.
+- **Sequential mode reintroduces time drift.** Models run at different times, so a change in backend load between them shows up as a model difference.
+- **Round-robin order is fixed.** Model A always goes first within a round; with many models and a long `--delay`, consider swapping the order between runs.
+- **Timed-out latencies are lower bounds.** A request cut off at `--timeout` would have taken at least that long; raise the timeout if the tail matters.
+- **Token rate needs usage data.** If the proxy doesn't return `usage` in the stream, `token_rate_tok_s` is `nan`; the tool prints a warning.
 
 ## Development
 

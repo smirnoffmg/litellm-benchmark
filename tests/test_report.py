@@ -154,3 +154,38 @@ def test_write_percentile_chart_xticklabels_match_defs(
     assert "p80" not in labels_seen
     for label in expected:
         assert label in labels_seen
+
+
+# --- Failures must stay visible in the summary ---
+
+
+def _row(latency: float, error: str = "") -> dict[str, Any]:
+    return {
+        "model": "m",
+        "request_index": 0,
+        "latency_s": latency,
+        "ttft_s": float("nan") if error else 0.1,
+        "completion_tokens": 0 if error else 10,
+        "token_rate_tok_s": float("nan") if error else 20.0,
+        "error": error,
+    }
+
+
+def test_write_summary_csv_reports_error_rate_and_sample_count(tmp_path: Path) -> None:
+    rows = [_row(1.0), _row(2.0), _row(3.0), _row(float("nan"), "connection refused")]
+    path = str(tmp_path / "summary.csv")
+    write_summary_csv(rows, path)
+    df = pd.read_csv(path)
+    latency = df[df["metric"] == "latency_s"].iloc[0]
+    assert latency["n"] == 3
+    assert latency["error_rate"] == 0.25
+
+
+def test_write_summary_csv_timeouts_land_in_latency_tail(tmp_path: Path) -> None:
+    rows = [_row(1.0)] * 9 + [_row(60.0, "timeout after 60.0s")]
+    path = str(tmp_path / "summary.csv")
+    write_summary_csv(rows, path)
+    df = pd.read_csv(path)
+    latency = df[df["metric"] == "latency_s"].iloc[0]
+    assert latency["p99"] > 50.0
+    assert latency["n"] == 10

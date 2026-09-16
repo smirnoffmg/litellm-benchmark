@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import os
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -47,9 +48,35 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="N",
         help="Max completion tokens per request (controls output length for fair comparison)",
     )
+    parser.add_argument(
+        "--sequential",
+        action="store_true",
+        help="Benchmark models one after another instead of interleaving "
+        "(use when models share one backend, e.g. a local Ollama)",
+    )
     parser.add_argument("--output", default=None, help="CSV output path")
     parser.add_argument("--chart", default=None, help="Chart output path")
     return parser.parse_args(argv)
+
+
+_MIN_SAMPLES_FOR_P99 = 100
+
+
+def result_warnings(results: list[dict[str, Any]], n_requests: int) -> list[str]:
+    warnings = []
+    if n_requests < _MIN_SAMPLES_FOR_P99:
+        warnings.append(
+            f"p99 from {n_requests} requests per model is effectively the maximum; "
+            f"use --requests {_MIN_SAMPLES_FOR_P99} or more for a meaningful tail"
+        )
+    succeeded = [r for r in results if not r["error"]]
+    no_usage = sum(1 for r in succeeded if r["completion_tokens"] == 0)
+    if no_usage:
+        warnings.append(
+            f"{no_usage} of {len(succeeded)} successful requests returned no token usage; "
+            "token rate is unavailable for them (does the proxy honour include_usage?)"
+        )
+    return warnings
 
 
 def get_config_from_env() -> dict[str, str]:
@@ -69,7 +96,11 @@ def main(argv: list[str] | None = None) -> None:
     output = args.output or f"results_{stem}.csv"
     chart = args.chart or f"chart_{stem}.png"
     summary = str(Path(output).with_name(Path(output).stem + "_summary.csv"))
-    percentile_chart = str(Path(chart).with_name(f"percentile_{stem}.png"))
+    percentile_chart = (
+        str(Path(chart).with_name(Path(chart).stem + "_percentile" + Path(chart).suffix))
+        if args.chart
+        else f"percentile_{stem}.png"
+    )
     results: list[dict[str, Any]] = asyncio.run(
         run_benchmark(
             base_url=config["base_url"],
@@ -82,8 +113,11 @@ def main(argv: list[str] | None = None) -> None:
             warmup=args.warmup,
             timeout_s=args.timeout,
             max_tokens=args.max_tokens,
+            sequential=args.sequential,
         )
     )
+    for warning in result_warnings(results, args.requests):
+        print(f"Warning: {warning}", file=sys.stderr)
     write_csv(results, output)
     write_summary_csv(results, summary)
     write_chart(results, chart)

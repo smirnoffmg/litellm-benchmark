@@ -225,3 +225,120 @@ def test_main_passes_timeout_and_max_tokens(monkeypatch: pytest.MonkeyPatch) -> 
 
     assert run_calls[0]["timeout_s"] == 45.0
     assert run_calls[0]["max_tokens"] == 100
+
+
+# --- Result-quality warnings ---
+
+
+def _ok_row(completion_tokens: int = 10) -> dict[str, Any]:
+    return {"model": "m", "completion_tokens": completion_tokens, "error": ""}
+
+
+def test_result_warnings_empty_for_large_clean_run() -> None:
+    from main import result_warnings
+
+    assert result_warnings([_ok_row()] * 100, n_requests=100) == []
+
+
+def test_result_warnings_flags_small_sample_for_p99() -> None:
+    from main import result_warnings
+
+    warnings = result_warnings([_ok_row()] * 20, n_requests=20)
+    assert len(warnings) == 1
+    assert "p99" in warnings[0]
+
+
+def test_result_warnings_flags_missing_usage() -> None:
+    from main import result_warnings
+
+    rows = [_ok_row(0), _ok_row(0), _ok_row(10)] * 50
+    warnings = result_warnings(rows, n_requests=150)
+    assert len(warnings) == 1
+    assert "100 of 150" in warnings[0]
+    assert "usage" in warnings[0]
+
+
+def test_result_warnings_ignores_failed_rows_for_usage() -> None:
+    from main import result_warnings
+
+    failed = {"model": "m", "completion_tokens": 0, "error": "timeout after 60.0s"}
+    assert result_warnings([failed] * 100, n_requests=100) == []
+
+
+def test_main_prints_warnings_to_stderr(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from main import main
+
+    monkeypatch.setenv("LITELLM_BASE_URL", "http://localhost:4000")
+    monkeypatch.setenv("LITELLM_API_KEY", "sk-test")
+
+    async def fake_run(**kwargs: Any) -> list[dict[str, Any]]:
+        return [_ok_row()]
+
+    monkeypatch.setattr("main.run_benchmark", fake_run)
+    for name in ("write_csv", "write_summary_csv", "write_chart", "write_percentile_chart"):
+        monkeypatch.setattr(f"main.{name}", lambda r, p: None)
+
+    main(["--model", "m", "--requests", "1"])
+
+    assert "p99" in capsys.readouterr().err
+
+
+def _capture_chart_paths(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
+    paths: dict[str, str] = {}
+
+    async def fake_run(**kwargs: Any) -> list[dict[str, Any]]:
+        return []
+
+    monkeypatch.setenv("LITELLM_BASE_URL", "http://localhost:4000")
+    monkeypatch.setenv("LITELLM_API_KEY", "sk-test")
+    monkeypatch.setattr("main._default_stem", lambda: "20260615_120000")
+    monkeypatch.setattr("main.run_benchmark", fake_run)
+    monkeypatch.setattr("main.write_csv", lambda r, p: None)
+    monkeypatch.setattr("main.write_summary_csv", lambda r, p: None)
+    monkeypatch.setattr("main.write_chart", lambda r, p: paths.update(chart=p))
+    monkeypatch.setattr("main.write_percentile_chart", lambda r, p: paths.update(percentile=p))
+    return paths
+
+
+def test_main_percentile_chart_follows_custom_chart_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    from main import main
+
+    paths = _capture_chart_paths(monkeypatch)
+    main(["--model", "m", "--requests", "100", "--chart", "out/my.png"])
+
+    assert paths["percentile"] == "out/my_percentile.png"
+
+
+def test_main_percentile_chart_default_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    from main import main
+
+    paths = _capture_chart_paths(monkeypatch)
+    main(["--model", "m", "--requests", "100"])
+
+    assert paths["percentile"] == "percentile_20260615_120000.png"
+
+
+def test_parse_args_sequential_default_off() -> None:
+    assert parse_args(["--model", "m"]).sequential is False
+
+
+def test_parse_args_sequential_flag() -> None:
+    assert parse_args(["--model", "m", "--sequential"]).sequential is True
+
+
+def test_main_passes_sequential(monkeypatch: pytest.MonkeyPatch) -> None:
+    from main import main
+
+    run_calls: list[dict[str, Any]] = []
+
+    async def fake_run(**kwargs: Any) -> list[dict[str, Any]]:
+        run_calls.append(kwargs)
+        return []
+
+    _capture_chart_paths(monkeypatch)
+    monkeypatch.setattr("main.run_benchmark", fake_run)
+    main(["--model", "m", "--requests", "100", "--sequential"])
+
+    assert run_calls[0]["sequential"] is True

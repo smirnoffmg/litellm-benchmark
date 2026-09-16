@@ -15,6 +15,13 @@ dependencies = [
 [project.scripts]
 litellm-benchmark = "main:main"
 
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["main.py", "runner.py", "report.py"]
+
 [dependency-groups]
 dev = [
     "pytest>=8.0",
